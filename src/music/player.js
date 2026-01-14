@@ -100,7 +100,16 @@ class GuildMusicManager {
           if (!streamObj || !streamObj.stream) throw new Error('No stream returned');
           resource = createAudioResource(streamObj.stream, { inputType: streamObj.type });
         } catch (e) {
-          console.error('[playNext] stream attempt failed:', e.message || e, 'resource:', next);
+          console.error('[playNext] stream attempt failed:', e && e.message ? e.message : e, 'resource:', next);
+
+          // Special-case: play-dl sometimes throws Invalid URL with input 'undefined' (internal missing field)
+          if (e && e.code === 'ERR_INVALID_URL' && e.input === 'undefined') {
+            console.error('[playNext] fatal Invalid URL (undefined) from play-dl, skipping resource:', next.source, next.title);
+            // do not re-enqueue - skip this resource
+            setTimeout(() => this._playNext(), 50);
+            return;
+          }
+
           // Re-enqueue with updated attempts to try again later
           this.queue.push(next);
           setTimeout(() => this._playNext(), 500);
