@@ -16,24 +16,82 @@ class GuildMusicManager {
   }
 
   async enqueueQuery(query) {
-    // search via play-dl
-    const results = await play.search(query, { limit: 1 });
-    if (!results || results.length === 0) throw new Error('No results');
-    const info = results[0];
+    // simple enqueue helper that defers to finding a playable candidate
+    const ok = await this.findAndEnqueuePlayable(query);
+    if (!ok) throw new Error('No playable source found for query');
+  }
 
-    // Try to determine a playable URL from the search result
-    let sourceUrl = info.url || info.link || null;
-    if (!sourceUrl && info.id) sourceUrl = `https://www.youtube.com/watch?v=${info.id}`;
-    if (!sourceUrl && play && typeof play.validate === 'function' && play.validate(query) === 'url') sourceUrl = query;
+  // Try to find a playable stream from search results for a query and enqueue it.
+  async findAndEnqueuePlayable(query) {
+    const results = await play.search(query, { limit: 6 });
+    if (!results || results.length === 0) return false;
+    for (const info of results) {
+      let sourceUrl = info.url || info.link || null;
+      if (!sourceUrl && info.id) sourceUrl = `https://www.youtube.com/watch?v=${info.id}`;
+      if (!sourceUrl) continue;
 
-    if (!sourceUrl) {
-      console.error('enqueueQuery: no playable source for result', info);
-      throw new Error('No playable source found for query');
+      try {
+        // quick check if play.stream works
+        const streamObj = await play.stream(sourceUrl).catch(() => null);
+        if (streamObj && streamObj.stream) {
+          console.log('[findAndEnqueuePlayable] enqueuing', { title: info.title, sourceUrl });
+          this.enqueueResource({ source: sourceUrl, title: info.title || query });
+          return true;
+        }
+      } catch (e) {
+        console.warn('[findAndEnqueuePlayable] candidate failed', sourceUrl, e && e.message ? e.message : e);
+        continue;
+      }
     }
+    return false;
+  }
 
-    console.log('[enqueueQuery] pushing to queue', { title: info.title, sourceUrl });
-    this.queue.push({ source: sourceUrl, title: info.title || query });
-    if (!this.current) this._playNext();
+  // Artist loop support: will keep queue populated with artist tracks
+  async fillArtist(artistName, desiredCount = 10) {
+    const seen = new Set(this.queue.map(q => q.title));
+    let added = 0;
+    // search broad results for the artist
+    const results = await play.search(artistName, { limit: 30 });
+    for (const info of results) {
+      if (added >= desiredCount) break;
+      const title = info.title || '';
+      if (seen.has(title)) continue;
+      const sourceUrl = info.url || (info.id ? `https://www.youtube.com/watch?v=${info.id}` : null);
+      if (!sourceUrl) continue;
+      try {
+        const streamObj = await play.stream(sourceUrl).catch(() => null);
+        if (streamObj && streamObj.stream) {
+          this.enqueueResource({ source: sourceUrl, title });
+          seen.add(title);
+          added++;
+        }
+      } catch (e) {
+        console.warn('[fillArtist] skipping candidate', sourceUrl, e && e.message ? e.message : e);
+        continue;
+      }
+    }
+    console.log('[fillArtist] added', added, 'tracks for', artistName);
+    return added;
+  }
+
+  startArtistLoop(artistName) {
+    this.artistName = artistName;
+    if (this.artistRefillInterval) clearInterval(this.artistRefillInterval);
+    // initial fill
+    this.fillArtist(artistName, 15).catch(e => console.error('startArtistLoop initial fill failed', e));
+    // background refill when queue drops below threshold
+    this.artistRefillInterval = setInterval(() => {
+      try {
+        if (this.queue.filter(q => q.source).length < 6) {
+          this.fillArtist(artistName, 10).catch(e => console.error('artist refill failed', e));
+        }
+      } catch (e) { console.error('artist loop interval error', e); }
+    }, 10_000);
+  }
+
+  stopArtistLoop() {
+    this.artistName = null;
+    if (this.artistRefillInterval) { clearInterval(this.artistRefillInterval); this.artistRefillInterval = null; }
   }
 
   enqueueResource(resource) {
