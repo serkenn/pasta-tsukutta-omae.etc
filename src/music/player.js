@@ -37,6 +37,8 @@ class GuildMusicManager {
   }
 
   enqueueResource(resource) {
+    // initialize attempts for retry logic
+    resource.attempts = resource.attempts || 0;
     if (resource.localPath) {
       if (!fs.existsSync(resource.localPath)) {
         console.error('[enqueueResource] localPath does not exist:', resource.localPath);
@@ -65,9 +67,45 @@ class GuildMusicManager {
         resource = createAudioResource(stream, { inputType: StreamType.Arbitrary, metadata: { title: next.title || next.localPath } });
         console.log('[playNext] playing local file', next.localPath);
       } else if (next.source) {
-        console.log('[playNext] streaming source', next.source);
-        const stream = await play.stream(next.source);
-        resource = createAudioResource(stream.stream, { inputType: stream.type });
+        // Retry guard
+        next.attempts = (next.attempts || 0) + 1;
+        if (next.attempts > 3) {
+          console.error('[playNext] too many attempts, skipping resource', next);
+          // proceed to next
+          setTimeout(() => this._playNext(), 50);
+          return;
+        }
+
+        console.log('[playNext] streaming source', next.source, 'attempt', next.attempts);
+
+        // Try to resolve video info first (more robust) and fallback to direct stream
+        try {
+          let info;
+          if (typeof next.source === 'string' && next.source.startsWith('http')) {
+            try {
+              info = await play.video_info(next.source);
+              console.log('[playNext] got video_info');
+            } catch (e) {
+              console.warn('[playNext] video_info failed, will try direct stream', e.message);
+            }
+          }
+
+          let streamObj;
+          if (info && info?.url) {
+            streamObj = await play.stream(info.url);
+          } else {
+            streamObj = await play.stream(next.source);
+          }
+
+          if (!streamObj || !streamObj.stream) throw new Error('No stream returned');
+          resource = createAudioResource(streamObj.stream, { inputType: streamObj.type });
+        } catch (e) {
+          console.error('[playNext] stream attempt failed:', e.message || e, 'resource:', next);
+          // Re-enqueue with updated attempts to try again later
+          this.queue.push(next);
+          setTimeout(() => this._playNext(), 500);
+          return;
+        }
       } else {
         console.error('Unknown resource type or missing source', next);
         throw new Error('Unknown resource type');
