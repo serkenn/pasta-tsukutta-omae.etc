@@ -1,7 +1,7 @@
 const { createAudioPlayer, createAudioResource, NoSubscriberBehavior, AudioPlayerStatus, StreamType } = require('@discordjs/voice');
 const play = require('play-dl');
 const fs = require('fs');
-const { spawn } = require('child_process'); // [追加] yt-dlpを実行するために必要
+const { spawn } = require('child_process');
 
 class GuildMusicManager {
   constructor(voiceConnection) {
@@ -22,7 +22,7 @@ class GuildMusicManager {
   }
 
   async findAndEnqueuePlayable(query) {
-    // 検索機能はまだ play-dl で動作しているようなので維持（動かなくなったらここも yt-dlp --get-id 等に変更が必要）
+    // 検索処理 (play-dlを使用)
     try {
         const results = await play.search(query, { limit: 6 });
         if (!results || results.length === 0) return false;
@@ -30,8 +30,7 @@ class GuildMusicManager {
           let sourceUrl = info.url || info.link || null;
           if (!sourceUrl && info.id) sourceUrl = `https://www.youtube.com/watch?v=${info.id}`;
           if (!sourceUrl) continue;
-
-          // ここでの play.stream チェックは失敗するため削除または簡易チェックに変更
+          
           console.log('[findAndEnqueuePlayable] enqueuing', { title: info.title, sourceUrl });
           this.enqueueResource({ source: sourceUrl, title: info.title || query });
           return true;
@@ -86,18 +85,28 @@ class GuildMusicManager {
 
   enqueueResource(resource) {
     resource.attempts = resource.attempts || 0;
-    if (resource.localPath) {
-      if (!fs.existsSync(resource.localPath)) {
+    if (resource.localPath && !fs.existsSync(resource.localPath)) {
         console.error('[enqueueResource] localPath does not exist:', resource.localPath);
         return;
-      }
-      console.log('[enqueueResource] enqueue local resource', resource.localPath);
-    } else if (resource.source) {
-      console.log('[enqueueResource] enqueue source resource', resource.source);
     }
-
+    console.log('[enqueueResource] pushing to queue', { title: resource.title, source: resource.source });
     this.queue.push(resource);
     if (!this.current) this._playNext();
+  }
+
+  // [追加] 強制割り込み再生 (現在の再生を止めて即座に再生)
+  forcePlayResource(resource) {
+    if (resource.localPath && !fs.existsSync(resource.localPath)) {
+        console.error('[forcePlayResource] localPath does not exist:', resource.localPath);
+        return;
+    }
+    console.log('[forcePlayResource] forcing playback:', resource.title);
+    
+    // キューの先頭に割り込ませる
+    this.queue.unshift(resource);
+    
+    // プレイヤーを停止 -> Idleイベントが発火 -> _playNext() が呼ばれ、先頭(これ)が再生される
+    this.player.stop();
   }
 
   async _playNext() {
@@ -111,30 +120,22 @@ class GuildMusicManager {
     try {
       let resource;
       if (next.localPath) {
-        // ローカルファイルの再生処理
-        console.log('[playNext] playing local file via fs', next.localPath);
+        console.log('[playNext] playing local file', next.localPath);
         const stream = fs.createReadStream(next.localPath);
         resource = createAudioResource(stream, { inputType: StreamType.Arbitrary, metadata: { title: next.title || next.localPath } });
       } else if (next.source) {
-        // YouTube等の再生処理 (yt-dlpを使用)
         console.log('[playNext] streaming source via yt-dlp', next.source);
-
-        // yt-dlp プロセスを起動して標準出力を取得
         const ytDlpProcess = spawn('yt-dlp', [
-            '-f', 'bestaudio', // 最高音質
+            '-f', 'bestaudio',
             '--no-playlist',
-            '-o', '-',         // 標準出力に出す
-            '-q',              // 静かに
+            '-o', '-',
+            '-q',
             next.source
         ]);
-
         ytDlpProcess.on('error', err => {
             console.error('[playNext] yt-dlp spawn error:', err);
-            // 失敗時は次へ
             setTimeout(() => this._playNext(), 1000);
         });
-        
-        // 取得した標準出力をリソース化
         resource = createAudioResource(ytDlpProcess.stdout, {
             inputType: StreamType.Arbitrary,
             metadata: { title: next.title }
@@ -152,6 +153,13 @@ class GuildMusicManager {
 
   skip() {
     this.player.stop(true);
+  }
+
+  // [追加] 完全停止コマンド用
+  stop() {
+    this.stopArtistLoop();
+    this.queue = []; // キューを全削除
+    this.player.stop(true); // 再生停止
   }
 
   pause() { this.player.pause(); }
