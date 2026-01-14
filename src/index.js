@@ -46,6 +46,7 @@ client.once('ready', async () => {
     { name: 'join', description: 'Join your voice channel' },
     { name: 'leave', description: 'Leave voice channel' },
     { name: 'play', description: 'Play a query or URL', options: [{ name: 'query', type: 3, description: 'Search query or URL', required: true }] },
+    { name: 'stop', description: 'Stop playback and clear queue' },
     { name: 'artist', description: 'Start artist loop (forced to 湘南乃風)' },
     { name: 'skip', description: 'Skip current track' },
     { name: 'pause', description: 'Pause' },
@@ -102,6 +103,15 @@ client.on('interactionCreate', async interaction => {
         console.error('play command error', e);
         return interaction.editReply(`再生に失敗しました: ${e.message}`);
       }
+    }
+
+    if (commandName === 'stop') {
+      const mgr = managers.get(interaction.guildId);
+      if (mgr) {
+        mgr.stop(); // 追加した stop() メソッドを呼ぶ
+        return interaction.reply('再生を停止し、キューをクリアしました');
+      }
+      return interaction.reply({ content: '再生中の曲がありません', ephemeral: true });
     }
 
     if (commandName === 'artist') {
@@ -181,7 +191,7 @@ client.on('messageCreate', async message => {
     const fs = require('fs');
     const bigPath = fs.existsSync(BIGWAVE_AUDIO) ? BIGWAVE_AUDIO : LOCAL_AUDIO;
     console.log('[messageCreate] bigwave trigger: ', { bigPath, exists: fs.existsSync(bigPath), memberVoiceId });
-    mgr.enqueueResource({ localPath: bigPath, title: 'bigwave' });
+    mgr.forcePlayResource({ localPath: bigPath, title: 'bigwave' });
     return message.reply('bigwave を再生します');
   }
 
