@@ -1,0 +1,6 @@
+token.txt
+node_modules/
+.env
+audio/*.mp3
+__pycache__/
+*.log
