@@ -1,6 +1,7 @@
 const { createAudioPlayer, createAudioResource, NoSubscriberBehavior, AudioPlayerStatus, StreamType } = require('@discordjs/voice');
 const play = require('play-dl');
 const fs = require('fs');
+const { spawn } = require('child_process'); // [追加] yt-dlpを実行するために必要
 
 class GuildMusicManager {
   constructor(voiceConnection) {
@@ -16,59 +17,50 @@ class GuildMusicManager {
   }
 
   async enqueueQuery(query) {
-    // simple enqueue helper that defers to finding a playable candidate
     const ok = await this.findAndEnqueuePlayable(query);
     if (!ok) throw new Error('No playable source found for query');
   }
 
-  // Try to find a playable stream from search results for a query and enqueue it.
   async findAndEnqueuePlayable(query) {
-    const results = await play.search(query, { limit: 6 });
-    if (!results || results.length === 0) return false;
-    for (const info of results) {
-      let sourceUrl = info.url || info.link || null;
-      if (!sourceUrl && info.id) sourceUrl = `https://www.youtube.com/watch?v=${info.id}`;
-      if (!sourceUrl) continue;
+    // 検索機能はまだ play-dl で動作しているようなので維持（動かなくなったらここも yt-dlp --get-id 等に変更が必要）
+    try {
+        const results = await play.search(query, { limit: 6 });
+        if (!results || results.length === 0) return false;
+        for (const info of results) {
+          let sourceUrl = info.url || info.link || null;
+          if (!sourceUrl && info.id) sourceUrl = `https://www.youtube.com/watch?v=${info.id}`;
+          if (!sourceUrl) continue;
 
-      try {
-        // quick check if play.stream works
-        const streamObj = await play.stream(sourceUrl).catch(() => null);
-        if (streamObj && streamObj.stream) {
+          // ここでの play.stream チェックは失敗するため削除または簡易チェックに変更
           console.log('[findAndEnqueuePlayable] enqueuing', { title: info.title, sourceUrl });
           this.enqueueResource({ source: sourceUrl, title: info.title || query });
           return true;
         }
-      } catch (e) {
-        console.warn('[findAndEnqueuePlayable] candidate failed', sourceUrl, e && e.message ? e.message : e);
-        continue;
-      }
+    } catch (e) {
+        console.warn('[findAndEnqueuePlayable] search failed', e);
     }
     return false;
   }
 
-  // Artist loop support: will keep queue populated with artist tracks
+  // Artist loop support
   async fillArtist(artistName, desiredCount = 10) {
     const seen = new Set(this.queue.map(q => q.title));
     let added = 0;
-    // search broad results for the artist
-    const results = await play.search(artistName, { limit: 30 });
-    for (const info of results) {
-      if (added >= desiredCount) break;
-      const title = info.title || '';
-      if (seen.has(title)) continue;
-      const sourceUrl = info.url || (info.id ? `https://www.youtube.com/watch?v=${info.id}` : null);
-      if (!sourceUrl) continue;
-      try {
-        const streamObj = await play.stream(sourceUrl).catch(() => null);
-        if (streamObj && streamObj.stream) {
+    try {
+        const results = await play.search(artistName, { limit: 30 });
+        for (const info of results) {
+          if (added >= desiredCount) break;
+          const title = info.title || '';
+          if (seen.has(title)) continue;
+          const sourceUrl = info.url || (info.id ? `https://www.youtube.com/watch?v=${info.id}` : null);
+          if (!sourceUrl) continue;
+          
           this.enqueueResource({ source: sourceUrl, title });
           seen.add(title);
           added++;
         }
-      } catch (e) {
-        console.warn('[fillArtist] skipping candidate', sourceUrl, e && e.message ? e.message : e);
-        continue;
-      }
+    } catch (e) {
+        console.warn('[fillArtist] search failed', e);
     }
     console.log('[fillArtist] added', added, 'tracks for', artistName);
     return added;
@@ -77,9 +69,7 @@ class GuildMusicManager {
   startArtistLoop(artistName) {
     this.artistName = artistName;
     if (this.artistRefillInterval) clearInterval(this.artistRefillInterval);
-    // initial fill
     this.fillArtist(artistName, 15).catch(e => console.error('startArtistLoop initial fill failed', e));
-    // background refill when queue drops below threshold
     this.artistRefillInterval = setInterval(() => {
       try {
         if (this.queue.filter(q => q.source).length < 6) {
@@ -95,7 +85,6 @@ class GuildMusicManager {
   }
 
   enqueueResource(resource) {
-    // initialize attempts for retry logic
     resource.attempts = resource.attempts || 0;
     if (resource.localPath) {
       if (!fs.existsSync(resource.localPath)) {
@@ -118,79 +107,45 @@ class GuildMusicManager {
     }
     const next = this.queue.shift();
     this.current = next;
+
     try {
       let resource;
       if (next.localPath) {
-        console.log('[playNext] attempting to stream local file via play-dl', next.localPath);
-        try {
-          const streamObj = await play.stream(next.localPath);
-          if (!streamObj || !streamObj.stream) throw new Error('No stream returned for local file');
-          resource = createAudioResource(streamObj.stream, { inputType: streamObj.type, metadata: { title: next.title || next.localPath } });
-          console.log('[playNext] playing local file via play-dl', next.localPath);
-        } catch (e) {
-          console.warn('[playNext] play.stream(local) failed, falling back to fs stream', e && e.message ? e.message : e);
-          const stream = fs.createReadStream(next.localPath);
-          resource = createAudioResource(stream, { inputType: StreamType.Arbitrary, metadata: { title: next.title || next.localPath } });
-          console.log('[playNext] playing local file via fs fallback', next.localPath);
-        }
-        try { console.log('[playNext] voiceConnection state', this.connection.state && this.connection.state.status, 'player state', this.player.state.status); } catch(e){}
+        // ローカルファイルの再生処理
+        console.log('[playNext] playing local file via fs', next.localPath);
+        const stream = fs.createReadStream(next.localPath);
+        resource = createAudioResource(stream, { inputType: StreamType.Arbitrary, metadata: { title: next.title || next.localPath } });
       } else if (next.source) {
-        // Retry guard
-        next.attempts = (next.attempts || 0) + 1;
-        if (next.attempts > 3) {
-          console.error('[playNext] too many attempts, skipping resource', next);
-          // proceed to next
-          setTimeout(() => this._playNext(), 50);
-          return;
-        }
+        // YouTube等の再生処理 (yt-dlpを使用)
+        console.log('[playNext] streaming source via yt-dlp', next.source);
 
-        console.log('[playNext] streaming source', next.source, 'attempt', next.attempts);
+        // yt-dlp プロセスを起動して標準出力を取得
+        const ytDlpProcess = spawn('yt-dlp', [
+            '-f', 'bestaudio', // 最高音質
+            '--no-playlist',
+            '-o', '-',         // 標準出力に出す
+            '-q',              // 静かに
+            next.source
+        ]);
 
-        // Try to resolve video info first (more robust) and fallback to direct stream
-        try {
-          let info;
-          if (typeof next.source === 'string' && next.source.startsWith('http')) {
-            try {
-              info = await play.video_info(next.source);
-              console.log('[playNext] got video_info');
-            } catch (e) {
-              console.warn('[playNext] video_info failed, will try direct stream', e.message);
-            }
-          }
-
-          let streamObj;
-          if (info && info?.url) {
-            streamObj = await play.stream(info.url);
-          } else {
-            streamObj = await play.stream(next.source);
-          }
-
-          if (!streamObj || !streamObj.stream) throw new Error('No stream returned');
-          resource = createAudioResource(streamObj.stream, { inputType: streamObj.type });
-        } catch (e) {
-          console.error('[playNext] stream attempt failed:', e && e.message ? e.message : e, 'resource:', next);
-
-          // Special-case: play-dl sometimes throws Invalid URL with input 'undefined' (internal missing field)
-          if (e && e.code === 'ERR_INVALID_URL' && e.input === 'undefined') {
-            console.error('[playNext] fatal Invalid URL (undefined) from play-dl, skipping resource:', next.source, next.title);
-            // do not re-enqueue - skip this resource
-            setTimeout(() => this._playNext(), 50);
-            return;
-          }
-
-          // Re-enqueue with updated attempts to try again later
-          this.queue.push(next);
-          setTimeout(() => this._playNext(), 500);
-          return;
-        }
-      } else {
-        console.error('Unknown resource type or missing source', next);
-        throw new Error('Unknown resource type');
+        ytDlpProcess.on('error', err => {
+            console.error('[playNext] yt-dlp spawn error:', err);
+            // 失敗時は次へ
+            setTimeout(() => this._playNext(), 1000);
+        });
+        
+        // 取得した標準出力をリソース化
+        resource = createAudioResource(ytDlpProcess.stdout, {
+            inputType: StreamType.Arbitrary,
+            metadata: { title: next.title }
+        });
       }
-      this.player.play(resource);
+
+      if (resource) {
+        this.player.play(resource);
+      }
     } catch (err) {
       console.error('Failed to play:', err, 'resource:', next);
-      // continue to next after short delay
       setTimeout(() => this._playNext(), 1000);
     }
   }
