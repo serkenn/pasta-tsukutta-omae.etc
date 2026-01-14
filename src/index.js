@@ -129,23 +129,30 @@ client.on('interactionCreate', async interaction => {
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
 
+  console.log(`[messageCreate] guild=${message.guildId} channel=${message.channel.id} author=${message.author.tag}`);
+  const content = message.content || '';
+  const isInTargetChannel = !TRIGGER_CHANNEL_ID || message.channel.id === TRIGGER_CHANNEL_ID;
+  const hasTriggerWord = TRIGGER_WORDS.some(w => w && content.includes(w));
+  const memberVoiceId = message.member && message.member.voice ? message.member.voice.channelId : null;
+  console.log(`[messageCreate] isInTargetChannel=${isInTargetChannel} hasTriggerWord=${hasTriggerWord} memberVoiceId=${memberVoiceId}`);
+
   // Mention handling: if bot is mentioned, respond and optionally play
   if (message.mentions.has(client.user)) {
     if (!message.member.voice.channel) return message.reply('VCに参加してください (メンションに反応するにはVC参加が必要です)');
     const mgr = getOrCreateManager(message.guildId, message.member.voice.channel);
+    console.log('[messageCreate] mention -> enqueue local audio', { local: LOCAL_AUDIO });
     // Play local audio when mentioned
     mgr.enqueueResource({ localPath: LOCAL_AUDIO, title: 'local_audio' });
     return message.reply('ローカル音源を再生します');
   }
 
   // Bigwave trigger: plays BIGWAVE_AUDIO when a trigger word (e.g., 僕 or 俺) appears in a configured channel (or anywhere if not set)
-  const content = message.content || '';
-  const isInTargetChannel = !TRIGGER_CHANNEL_ID || message.channel.id === TRIGGER_CHANNEL_ID;
-  const hasTriggerWord = TRIGGER_WORDS.some(w => w && content.includes(w));
   if (isInTargetChannel && hasTriggerWord) {
     if (!message.member.voice.channel) return message.reply('VCに参加してください');
     const mgr = getOrCreateManager(message.guildId, message.member.voice.channel);
-    const bigPath = require('fs').existsSync(BIGWAVE_AUDIO) ? BIGWAVE_AUDIO : LOCAL_AUDIO;
+    const fs = require('fs');
+    const bigPath = fs.existsSync(BIGWAVE_AUDIO) ? BIGWAVE_AUDIO : LOCAL_AUDIO;
+    console.log('[messageCreate] bigwave trigger: ', { bigPath, exists: fs.existsSync(bigPath), memberVoiceId });
     mgr.enqueueResource({ localPath: bigPath, title: 'bigwave' });
     return message.reply('bigwave を再生します');
   }
@@ -154,6 +161,7 @@ client.on('messageCreate', async message => {
   if (message.content.includes(TRIGGER_TEXT)) {
     if (!message.member.voice.channel) return message.reply('VCに参加してください');
     const mgr = getOrCreateManager(message.guildId, message.member.voice.channel);
+    console.log('[messageCreate] trigger text -> enqueue local audio', { local: LOCAL_AUDIO });
     mgr.enqueueResource({ localPath: LOCAL_AUDIO, title: 'local_audio' });
     return message.reply('トリガ音源を再生します');
   }
