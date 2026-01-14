@@ -63,9 +63,19 @@ class GuildMusicManager {
     try {
       let resource;
       if (next.localPath) {
-        const stream = fs.createReadStream(next.localPath);
-        resource = createAudioResource(stream, { inputType: StreamType.Arbitrary, metadata: { title: next.title || next.localPath } });
-        console.log('[playNext] playing local file', next.localPath);
+        console.log('[playNext] attempting to stream local file via play-dl', next.localPath);
+        try {
+          const streamObj = await play.stream(next.localPath);
+          if (!streamObj || !streamObj.stream) throw new Error('No stream returned for local file');
+          resource = createAudioResource(streamObj.stream, { inputType: streamObj.type, metadata: { title: next.title || next.localPath } });
+          console.log('[playNext] playing local file via play-dl', next.localPath);
+        } catch (e) {
+          console.warn('[playNext] play.stream(local) failed, falling back to fs stream', e && e.message ? e.message : e);
+          const stream = fs.createReadStream(next.localPath);
+          resource = createAudioResource(stream, { inputType: StreamType.Arbitrary, metadata: { title: next.title || next.localPath } });
+          console.log('[playNext] playing local file via fs fallback', next.localPath);
+        }
+        try { console.log('[playNext] voiceConnection state', this.connection.state && this.connection.state.status, 'player state', this.player.state.status); } catch(e){}
       } else if (next.source) {
         // Retry guard
         next.attempts = (next.attempts || 0) + 1;
