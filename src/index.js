@@ -9,6 +9,9 @@ const TOKEN = process.env.BOT_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const TRIGGER_TEXT = process.env.TRIGGER_TEXT || 'play_local';
 const LOCAL_AUDIO = process.env.LOCAL_AUDIO || './audio/sample.mp3';
+const TRIGGER_CHANNEL_ID = process.env.TRIGGER_CHANNEL_ID || '';
+const TRIGGER_WORDS = (process.env.TRIGGER_WORDS || '僕,俺').split(',').map(s => s.trim()).filter(Boolean);
+const BIGWAVE_AUDIO = process.env.BIGWAVE_AUDIO || './audio/bigwave.mp3';
 const ARTIST_NAME = process.env.ARTIST_NAME || '湘南乃風';
 
 if (!TOKEN) {
@@ -135,7 +138,19 @@ client.on('messageCreate', async message => {
     return message.reply('ローカル音源を再生します');
   }
 
-  // Text trigger for local audio
+  // Bigwave trigger: plays BIGWAVE_AUDIO when a trigger word (e.g., 僕 or 俺) appears in a configured channel (or anywhere if not set)
+  const content = message.content || '';
+  const isInTargetChannel = !TRIGGER_CHANNEL_ID || message.channel.id === TRIGGER_CHANNEL_ID;
+  const hasTriggerWord = TRIGGER_WORDS.some(w => w && content.includes(w));
+  if (isInTargetChannel && hasTriggerWord) {
+    if (!message.member.voice.channel) return message.reply('VCに参加してください');
+    const mgr = getOrCreateManager(message.guildId, message.member.voice.channel);
+    const bigPath = require('fs').existsSync(BIGWAVE_AUDIO) ? BIGWAVE_AUDIO : LOCAL_AUDIO;
+    mgr.enqueueResource({ localPath: bigPath, title: 'bigwave' });
+    return message.reply('bigwave を再生します');
+  }
+
+  // Legacy text trigger for local audio
   if (message.content.includes(TRIGGER_TEXT)) {
     if (!message.member.voice.channel) return message.reply('VCに参加してください');
     const mgr = getOrCreateManager(message.guildId, message.member.voice.channel);

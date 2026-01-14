@@ -28,6 +28,7 @@
 - /play <query or URL>: YouTubeから曲を検索して再生
 - /artist: 湘南乃風のみを無限ループで再生
 - メンションまたは `TRIGGER_TEXT` を含むメッセージで `LOCAL_AUDIO` を再生
+- 指定のチャネル（`TRIGGER_CHANNEL_ID`）内でメッセージに「僕」または「俺」が含まれると `audio/bigwave.mp3` を再生します（`TRIGGER_WORDS` で単語を変更可能）。
 
 ### 注意
 - Spotifyの音声直接再生は行っていません。YouTube検索経由で再生します。
