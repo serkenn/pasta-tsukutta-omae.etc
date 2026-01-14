@@ -59,70 +59,98 @@ client.once('ready', async () => {
   } else {
     await client.application.commands.set(commands); // global (may take time)
   }
+
+  // global error handlers to avoid process crash on unhandled rejections
+  process.on('unhandledRejection', (reason, p) => {
+    console.error('Unhandled Rejection at:', p, 'reason:', reason);
+  });
+  process.on('uncaughtException', (err) => {
+    console.error('Uncaught Exception:', err);
+  });
 });
 
 client.on('interactionCreate', async interaction => {
   if (!interaction.isCommand()) return;
-  const { commandName } = interaction;
-  const member = interaction.member;
-  if (commandName === 'join') {
-    if (!member.voice.channel) return interaction.reply({ content: 'VCに参加してください', ephemeral: true });
-    getOrCreateManager(interaction.guildId, member.voice.channel);
-    return interaction.reply('参加しました');
-  }
+  try {
+    const { commandName } = interaction;
+    const member = interaction.member;
 
-  if (commandName === 'leave') {
-    const mgr = managers.get(interaction.guildId);
-    if (mgr) {
-      try { mgr.connection.destroy(); managers.delete(interaction.guildId); }
-      catch(e){}
+    if (commandName === 'join') {
+      if (!member.voice.channel) return interaction.reply({ content: 'VCに参加してください', ephemeral: true });
+      getOrCreateManager(interaction.guildId, member.voice.channel);
+      return interaction.reply('参加しました');
     }
-    return interaction.reply('退出しました');
-  }
 
-  if (commandName === 'play') {
-    const query = interaction.options.getString('query');
-    if (!member.voice.channel) return interaction.reply({ content: 'VCに参加してください', ephemeral: true });
-    const mgr = getOrCreateManager(interaction.guildId, member.voice.channel);
-    await mgr.enqueueQuery(query);
-    return interaction.reply(`キューに追加: ${query}`);
-  }
-
-  if (commandName === 'artist') {
-    // Enforce 湘南乃風 only
-    if (!member.voice.channel) return interaction.reply({ content: 'VCに参加してください', ephemeral: true });
-    const mgr = getOrCreateManager(interaction.guildId, member.voice.channel);
-    // enqueue a set of known queries for 湘南乃風
-    const seed = [
-      '湘南乃風 波音',
-      '湘南乃風 純恋歌',
-      '湘南乃風 睡蓮',
-      '湘南乃風 睡蓮',
-      '湘南乃風 僕の見ている風景'
-    ];
-    // push them in a loop by re-adding when queue empties: simple approach - add many entries
-    for (let i = 0; i < 10; i++) {
-      seed.forEach(q => mgr.enqueueQuery(q).catch(e => console.error(e)));
+    if (commandName === 'leave') {
+      const mgr = managers.get(interaction.guildId);
+      if (mgr) {
+        try { mgr.connection.destroy(); managers.delete(interaction.guildId); }
+        catch(e){}
+      }
+      return interaction.reply('退出しました');
     }
-    return interaction.reply('湘南乃風ループを開始しました（湘南乃風のみ流れます）');
-  }
 
-  if (commandName === 'skip') {
-    const mgr = managers.get(interaction.guildId);
-    if (mgr) { mgr.skip(); return interaction.reply('スキップしました'); }
-    return interaction.reply({ content: '再生中の曲がありません', ephemeral: true });
-  }
+    if (commandName === 'play') {
+      const query = interaction.options.getString('query');
+      if (!member.voice.channel) return interaction.reply({ content: 'VCに参加してください', ephemeral: true });
+      await interaction.deferReply();
+      const mgr = getOrCreateManager(interaction.guildId, member.voice.channel);
+      try {
+        await mgr.enqueueQuery(query);
+        return interaction.editReply(`キューに追加: ${query}`);
+      } catch (e) {
+        console.error('play command error', e);
+        return interaction.editReply(`再生に失敗しました: ${e.message}`);
+      }
+    }
 
-  if (commandName === 'pause') {
-    const mgr = managers.get(interaction.guildId);
-    if (mgr) { mgr.pause(); return interaction.reply('一時停止しました'); }
-    return interaction.reply({ content: '再生中の曲がありません', ephemeral: true });
-  }
+    if (commandName === 'artist') {
+      if (!member.voice.channel) return interaction.reply({ content: 'VCに参加してください', ephemeral: true });
+      await interaction.deferReply();
+      const mgr = getOrCreateManager(interaction.guildId, member.voice.channel);
+      const seed = [
+        '湘南乃風 波音',
+        '湘南乃風 純恋歌',
+        '湘南乃風 睡蓮',
+        '湘南乃風 睡蓮',
+        '湘南乃風 僕の見ている風景'
+      ];
+      try {
+        for (let i = 0; i < 10; i++) {
+          for (const q of seed) {
+            await mgr.enqueueQuery(q).catch(e => console.error('artist enqueue error', e));
+          }
+        }
+        return interaction.editReply('湘南乃風ループを開始しました（湘南乃風のみ流れます）');
+      } catch (e) {
+        console.error('artist command error', e);
+        return interaction.editReply('湘南乃風ループ開始に失敗しました');
+      }
+    }
 
-  if (commandName === 'resume') {
-    const mgr = managers.get(interaction.guildId);
-    if (mgr) { mgr.resume(); return interaction.reply('再開しました'); }
-    return interaction.reply({ content: '再生中の曲がありません', ephemeral: true });
+    if (commandName === 'skip') {
+      const mgr = managers.get(interaction.guildId);
+      if (mgr) { mgr.skip(); return interaction.reply('スキップしました'); }
+      return interaction.reply({ content: '再生中の曲がありません', ephemeral: true });
+    }
+
+    if (commandName === 'pause') {
+      const mgr = managers.get(interaction.guildId);
+      if (mgr) { mgr.pause(); return interaction.reply('一時停止しました'); }
+      return interaction.reply({ content: '再生中の曲がありません', ephemeral: true });
+    }
+
+    if (commandName === 'resume') {
+      const mgr = managers.get(interaction.guildId);
+      if (mgr) { mgr.resume(); return interaction.reply('再開しました'); }
+      return interaction.reply({ content: '再生中の曲がありません', ephemeral: true });
+    }
+  } catch (err) {
+    console.error('interactionCreate error', err);
+    try {
+      if (interaction.replied || interaction.deferred) await interaction.followUp({ content: '内部エラーが発生しました', ephemeral: true });
+      else await interaction.reply({ content: '内部エラーが発生しました', ephemeral: true });
+    } catch (e) { console.error('failed to notify interaction error', e); }
   }
 });
 
