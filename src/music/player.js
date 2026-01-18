@@ -9,6 +9,8 @@ class GuildMusicManager {
     this.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Stop } });
     this.queue = [];
     this.current = null;
+    this.disconnectTimer = null; // 自動退室用のタイマー保持用
+
     this.player.on(AudioPlayerStatus.Idle, () => this._playNext());
     this.player.on(AudioPlayerStatus.Playing, () => console.log('[Player] status=Playing'));
     this.player.on('error', err => console.error('[Player Error]', err));
@@ -22,7 +24,6 @@ class GuildMusicManager {
   }
 
   async findAndEnqueuePlayable(query) {
-    // 検索処理 (play-dlを使用)
     try {
         const results = await play.search(query, { limit: 6 });
         if (!results || results.length === 0) return false;
@@ -41,7 +42,6 @@ class GuildMusicManager {
     return false;
   }
 
-  // Artist loop support
   async fillArtist(artistName, desiredCount = 10) {
     const seen = new Set(this.queue.map(q => q.title));
     let added = 0;
@@ -94,18 +94,13 @@ class GuildMusicManager {
     if (!this.current) this._playNext();
   }
 
-  // [追加] 強制割り込み再生 (現在の再生を止めて即座に再生)
   forcePlayResource(resource) {
     if (resource.localPath && !fs.existsSync(resource.localPath)) {
         console.error('[forcePlayResource] localPath does not exist:', resource.localPath);
         return;
     }
     console.log('[forcePlayResource] forcing playback:', resource.title);
-    
-    // キューの先頭に割り込ませる
     this.queue.unshift(resource);
-    
-    // プレイヤーを停止 -> Idleイベントが発火 -> _playNext() が呼ばれ、先頭(これ)が再生される
     this.player.stop();
   }
 
@@ -119,15 +114,23 @@ class GuildMusicManager {
 
     try {
       let resource;
+      // 音量調整を有効にするオプション (YouTube用、ローカル用共通)
+      const resourceOptions = { 
+          inputType: StreamType.Arbitrary, 
+          inlineVolume: true, // これにより volume.setVolume が使えるようになります
+          metadata: { title: next.title || next.localPath } 
+      };
+
       if (next.localPath) {
         console.log('[playNext] playing local file', next.localPath);
         const stream = fs.createReadStream(next.localPath);
-        resource = createAudioResource(stream, { inputType: StreamType.Arbitrary, metadata: { title: next.title || next.localPath } });
+        resource = createAudioResource(stream, resourceOptions);
       } else if (next.source) {
         console.log('[playNext] streaming source via yt-dlp', next.source);
         const ytDlpProcess = spawn('yt-dlp', [
-            '-f', 'bestaudio',
+            '-f', 'bestaudio', // 最高音質
             '--no-playlist',
+            '--buffer-size', '16K', // バッファサイズを指定してストリームを安定化
             '-o', '-',
             '-q',
             next.source
@@ -136,13 +139,14 @@ class GuildMusicManager {
             console.error('[playNext] yt-dlp spawn error:', err);
             setTimeout(() => this._playNext(), 1000);
         });
-        resource = createAudioResource(ytDlpProcess.stdout, {
-            inputType: StreamType.Arbitrary,
-            metadata: { title: next.title }
-        });
+        resource = createAudioResource(ytDlpProcess.stdout, resourceOptions);
       }
 
       if (resource) {
+        // 音量を40%に設定
+        if (resource.volume) {
+            resource.volume.setVolume(0.4); 
+        }
         this.player.play(resource);
       }
     } catch (err) {
@@ -155,11 +159,10 @@ class GuildMusicManager {
     this.player.stop(true);
   }
 
-  // [追加] 完全停止コマンド用
   stop() {
     this.stopArtistLoop();
-    this.queue = []; // キューを全削除
-    this.player.stop(true); // 再生停止
+    this.queue = [];
+    this.player.stop(true);
   }
 
   pause() { this.player.pause(); }

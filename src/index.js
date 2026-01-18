@@ -27,7 +27,15 @@ const client = new Client({
 const managers = new Map();
 
 function getOrCreateManager(guildId, voiceChannel) {
-  if (managers.has(guildId)) return managers.get(guildId);
+  if (managers.has(guildId)) {
+      const mgr = managers.get(guildId);
+      // 再参加時に自動退室タイマーが動いていたら解除
+      if (mgr.disconnectTimer) {
+          clearTimeout(mgr.disconnectTimer);
+          mgr.disconnectTimer = null;
+      }
+      return mgr;
+  }
   const connection = joinVoiceChannel({
     channelId: voiceChannel.id,
     guildId: guildId,
@@ -41,7 +49,6 @@ function getOrCreateManager(guildId, voiceChannel) {
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
-  // register simple commands to guild for dev
   const commands = [
     { name: 'join', description: 'Join your voice channel' },
     { name: 'leave', description: 'Leave voice channel' },
@@ -58,16 +65,60 @@ client.once('ready', async () => {
     if (guild) await guild.commands.set(commands);
     else console.warn('GUILD_ID set but guild not in cache on startup');
   } else {
-    await client.application.commands.set(commands); // global (may take time)
+    await client.application.commands.set(commands);
   }
 
-  // global error handlers to avoid process crash on unhandled rejections
   process.on('unhandledRejection', (reason, p) => {
     console.error('Unhandled Rejection at:', p, 'reason:', reason);
   });
   process.on('uncaughtException', (err) => {
     console.error('Uncaught Exception:', err);
   });
+});
+
+// 自動退室の実装
+client.on('voiceStateUpdate', (oldState, newState) => {
+    const guildId = oldState.guild.id || newState.guild.id;
+    const mgr = managers.get(guildId);
+    
+    // Botが接続していない、または接続が切れている場合は無視
+    if (!mgr || !mgr.connection || mgr.connection.state.status === 'destroyed') return;
+
+    // 現在BotがいるチャンネルIDを取得
+    const botChannelId = mgr.connection.joinConfig.channelId;
+
+    // 変化があったチャンネルがBotのいるチャンネルかどうか
+    if (oldState.channelId === botChannelId || newState.channelId === botChannelId) {
+        const channel = oldState.guild.channels.cache.get(botChannelId);
+        if (channel && channel.members) {
+            // Bot以外のメンバー（人間）の数をカウント
+            const humans = channel.members.filter(m => !m.user.bot).size;
+            
+            if (humans === 0) {
+                // 誰もいなくなったらタイマーセット (30秒後)
+                if (!mgr.disconnectTimer) {
+                    console.log(`[AutoDisconnect] Channel empty in ${guildId}, leaving in 30s...`);
+                    mgr.disconnectTimer = setTimeout(() => {
+                        console.log(`[AutoDisconnect] Leaving guild ${guildId} due to inactivity`);
+                        try {
+                            mgr.stop(); // 再生停止
+                            mgr.connection.destroy(); // 切断
+                            managers.delete(guildId); // マネージャー削除
+                        } catch (e) {
+                            console.error('[AutoDisconnect] Error:', e);
+                        }
+                    }, 30_000); 
+                }
+            } else {
+                // 人がいるならタイマー解除
+                if (mgr.disconnectTimer) {
+                    console.log(`[AutoDisconnect] Humans returned, timer cancelled.`);
+                    clearTimeout(mgr.disconnectTimer);
+                    mgr.disconnectTimer = null;
+                }
+            }
+        }
+    }
 });
 
 client.on('interactionCreate', async interaction => {
@@ -108,7 +159,7 @@ client.on('interactionCreate', async interaction => {
     if (commandName === 'stop') {
       const mgr = managers.get(interaction.guildId);
       if (mgr) {
-        mgr.stop(); // 追加した stop() メソッドを呼ぶ
+        mgr.stop();
         return interaction.reply('再生を停止し、キューをクリアしました');
       }
       return interaction.reply({ content: '再生中の曲がありません', ephemeral: true });
@@ -174,17 +225,16 @@ client.on('messageCreate', async message => {
   const memberVoiceId = message.member && message.member.voice ? message.member.voice.channelId : null;
   console.log(`[messageCreate] isInTargetChannel=${isInTargetChannel} hasTriggerWord=${hasTriggerWord} memberVoiceId=${memberVoiceId}`);
 
-  // Mention handling: if bot is mentioned, respond and optionally play
+  // Mention handling
   if (message.mentions.has(client.user)) {
     if (!message.member.voice.channel) return message.reply('VCに参加してください (メンションに反応するにはVC参加が必要です)');
     const mgr = getOrCreateManager(message.guildId, message.member.voice.channel);
     console.log('[messageCreate] mention -> enqueue local audio', { local: LOCAL_AUDIO });
-    // Play local audio when mentioned
     mgr.enqueueResource({ localPath: LOCAL_AUDIO, title: 'local_audio' });
     return message.reply('ローカル音源を再生します');
   }
 
-  // Bigwave trigger: plays BIGWAVE_AUDIO when a trigger word (e.g., 僕 or 俺) appears in a configured channel (or anywhere if not set)
+  // Bigwave trigger
   if (isInTargetChannel && hasTriggerWord) {
     if (!message.member.voice.channel) return message.reply('VCに参加してください');
     const mgr = getOrCreateManager(message.guildId, message.member.voice.channel);
@@ -195,7 +245,7 @@ client.on('messageCreate', async message => {
     return message.reply('bigwave を再生します');
   }
 
-  // Legacy text trigger for local audio
+  // Legacy text trigger
   if (message.content.includes(TRIGGER_TEXT)) {
     if (!message.member.voice.channel) return message.reply('VCに参加してください');
     const mgr = getOrCreateManager(message.guildId, message.member.voice.channel);
