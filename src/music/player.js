@@ -1,6 +1,4 @@
 const { createAudioPlayer, createAudioResource, NoSubscriberBehavior, AudioPlayerStatus, StreamType } = require('@discordjs/voice');
-// play-dl は検索に使わないため削除可能ですが、既存互換のために残すか、完全に yt-dlp に移行します
-const play = require('play-dl'); 
 const fs = require('fs');
 const { spawn } = require('child_process');
 
@@ -10,9 +8,9 @@ class GuildMusicManager {
     this.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Stop } });
     this.queue = [];
     this.current = null;
-    this.textChannel = null; // 通知を送るチャンネル
+    this.textChannel = null;
     this.disconnectTimer = null;
-    this.artistPool = []; // アーティストモード用の曲リストキャッシュ
+    this.artistPool = [];
 
     this.player.on(AudioPlayerStatus.Idle, () => this._playNext());
     this.player.on('error', err => console.error('[Player Error]', err));
@@ -20,44 +18,64 @@ class GuildMusicManager {
     console.log(`[GuildMusicManager] created for guild ${voiceConnection.joinConfig.guildId}`);
   }
 
-  // 通知先のテキストチャンネルをセット
   setTextChannel(channel) {
     this.textChannel = channel;
   }
 
   async enqueueQuery(query) {
-    // 通常の検索再生（既存維持）
     const ok = await this.findAndEnqueuePlayable(query);
     if (!ok) throw new Error('No playable source found for query');
   }
 
+  // yt-dlp を使って URL または 検索ワードから動画情報を取得する
   async findAndEnqueuePlayable(query) {
-    try {
-        // 通常検索も play-dl が不安定なら yt-dlp --get-id 等に置き換えるべきですが
-        // 今回はアーティストループの修正を優先します。
-        const results = await play.search(query, { limit: 1 });
-        if (!results || results.length === 0) return false;
-        
-        const info = results[0];
-        let sourceUrl = info.url || (info.id ? `https://www.youtube.com/watch?v=${info.id}` : null);
-        if (!sourceUrl) return false;
+    console.log('[findAndEnqueuePlayable] processing:', query);
+    return new Promise((resolve) => {
+        // --default-search ytsearch1 により、URLならそのURLを、単語なら検索してトップ1件を取得します
+        // --print でタイトルとURLだけを取得（動画はダウンロードしない）
+        const yt = spawn('yt-dlp', [
+            '--default-search', 'ytsearch1',
+            '--print', '%(title)s__SEPARATOR__%(webpage_url)s',
+            '--no-playlist',
+            query
+        ]);
 
-        this.enqueueResource({ source: sourceUrl, title: info.title || query });
-        return true;
-    } catch (e) {
-        console.warn('[findAndEnqueuePlayable] search failed', e);
-    }
-    return false;
+        let data = '';
+        yt.stdout.on('data', chunk => { data += chunk; });
+        
+        yt.on('close', code => {
+            if (code !== 0 || !data.trim()) {
+                console.warn('[findAndEnqueuePlayable] yt-dlp failed or found nothing. code:', code);
+                resolve(false);
+                return;
+            }
+            
+            // 出力例: "Video Title__SEPARATOR__https://youtube.com/..."
+            const lines = data.split('\n').filter(Boolean);
+            if (lines.length === 0) {
+                resolve(false);
+                return;
+            }
+
+            const [title, url] = lines[0].split('__SEPARATOR__');
+            if (!url) {
+                resolve(false);
+                return;
+            }
+
+            this.enqueueResource({ source: url, title: title || query });
+            resolve(true);
+        });
+    });
   }
 
-  // 指定URL（チャンネル）から動画リストを取得してプールに貯める
+  // 指定URL（チャンネル）から動画リストを取得
   async loadArtistTracks(channelUrl) {
     console.log('[loadArtistTracks] Fetching list from:', channelUrl);
     return new Promise((resolve) => {
-        // yt-dlp でフラットプレイリストとして高速に全件取得
         const yt = spawn('yt-dlp', [
             '--flat-playlist',
-            '--print', '%(url)s__SEPARATOR__%(title)s', // URLとタイトルを区切り文字で出力
+            '--print', '%(url)s__SEPARATOR__%(title)s',
             channelUrl
         ]);
 
@@ -76,7 +94,7 @@ class GuildMusicManager {
                 return { source: url, title: title || 'Unknown Title' };
             });
             
-            // シャッフル (Fisher-Yates)
+            // シャッフル
             for (let i = this.artistPool.length - 1; i > 0; i--) {
                 const j = Math.floor(Math.random() * (i + 1));
                 [this.artistPool[i], this.artistPool[j]] = [this.artistPool[j], this.artistPool[i]];
@@ -90,29 +108,20 @@ class GuildMusicManager {
 
   async fillFromPool(count = 5) {
     if (this.artistPool.length === 0) return;
-    
-    // プールから取り出してキューに入れる（プールが空になったら再利用するか、ループ終了などの制御が可能）
-    // ここではプールを消費せずにランダムに取り出す、または順次取り出す実装にします
-    // シンプルにプールをローテーションさせてキューに追加します
     for (let i = 0; i < count; i++) {
-        const track = this.artistPool.shift(); // 先頭を取得
+        const track = this.artistPool.shift();
         if (track) {
             this.enqueueResource(track);
-            this.artistPool.push(track); // 末尾に戻す（無限ループ用）
+            this.artistPool.push(track);
         }
     }
   }
 
   async startArtistLoop(channelUrl) {
     this.stopArtistLoop();
-    // 初回ロード
     await this.loadArtistTracks(channelUrl);
     if (this.artistPool.length === 0) return;
-
-    // 最初に5曲ほどキューに入れる
     this.fillFromPool(5);
-
-    // 定期的にキューを補充するタイマー
     this.artistRefillInterval = setInterval(() => {
         if (this.queue.length < 3) {
             this.fillFromPool(5);
@@ -170,7 +179,6 @@ class GuildMusicManager {
             next.source
         ]);
 
-        // エラーハンドリング: プロセス起動エラーのみキャッチ
         ytDlpProcess.on('error', err => {
             console.error('[playNext] yt-dlp spawn error:', err);
             setTimeout(() => this._playNext(), 1000);
@@ -180,20 +188,17 @@ class GuildMusicManager {
       }
 
       if (resource) {
-        if (resource.volume) resource.volume.setVolume(0.4);
+        // 【修正】音量を 0.1 (10%) に設定
+        if (resource.volume) resource.volume.setVolume(0.1);
         
         this.player.play(resource);
 
-        // 【追加】再生成功メッセージの送信
-        // 実際に音が鳴り始めたタイミングに近いここで送信
-        if (this.textChannel && next.source) { // ローカル音源のときは通知しない設定（必要なら条件変更）
+        if (this.textChannel && next.source) {
             this.textChannel.send(`🎵 **Now Playing**\n**${next.title}**\n${next.source}`).catch(e => console.error('Failed to send playing msg', e));
         }
       }
     } catch (err) {
-      // エラー時はログを出すだけで、チャットには流さない
       console.error('Failed to play:', err.message);
-      // 次の曲へ
       setTimeout(() => this._playNext(), 2000);
     }
   }
