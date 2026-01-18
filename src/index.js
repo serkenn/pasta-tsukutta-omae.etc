@@ -1,7 +1,7 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
-const { Client, GatewayIntentBits, Partials, Events } = require('discord.js');
+const { Client, GatewayIntentBits, ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js');
 const { joinVoiceChannel } = require('@discordjs/voice');
 const GuildMusicManager = require('./music/player');
 
@@ -12,8 +12,6 @@ const LOCAL_AUDIO = process.env.LOCAL_AUDIO || './audio/sample.mp3';
 const TRIGGER_CHANNEL_ID = process.env.TRIGGER_CHANNEL_ID || '';
 const TRIGGER_WORDS = (process.env.TRIGGER_WORDS || '僕,俺').split(',').map(s => s.trim()).filter(Boolean);
 const BIGWAVE_AUDIO = process.env.BIGWAVE_AUDIO || './audio/bigwave.mp3';
-// 湘南乃風 公式チャンネルのリリース（またはVideos）URL
-// const ARTIST_URL = 'https://www.youtube.com/@134Recordingsch/releases'; // Releasesだと取得できない場合があるのでvideos推奨
 const ARTIST_URL = 'https://www.youtube.com/@134Recordingsch/videos'; 
 
 if (!TOKEN) {
@@ -27,7 +25,6 @@ const client = new Client({
 
 const managers = new Map();
 
-// テキストチャンネル情報を受け取るように引数を追加
 function getOrCreateManager(guildId, voiceChannel, textChannel) {
   let mgr = managers.get(guildId);
   if (mgr) {
@@ -35,7 +32,6 @@ function getOrCreateManager(guildId, voiceChannel, textChannel) {
           clearTimeout(mgr.disconnectTimer);
           mgr.disconnectTimer = null;
       }
-      // コマンド実行のたびに最新のテキストチャンネルをセットする（返信先を更新するため）
       if (textChannel) mgr.setTextChannel(textChannel);
       return mgr;
   }
@@ -61,7 +57,20 @@ client.once('ready', async () => {
     { name: 'artist', description: 'Start artist loop (湘南乃風 Official Channel)' },
     { name: 'skip', description: 'Skip current track' },
     { name: 'pause', description: 'Pause' },
-    { name: 'resume', description: 'Resume' }
+    { name: 'resume', description: 'Resume' },
+    // 音量コマンドの追加
+    { 
+        name: 'volume', 
+        description: 'Set volume (0-100)', 
+        options: [{ 
+            name: 'level', 
+            type: 4, // Integer
+            description: 'Volume percentage (0-100)', 
+            required: true,
+            minValue: 0,
+            maxValue: 100
+        }] 
+    }
   ];
 
   if (GUILD_ID) {
@@ -106,6 +115,18 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 });
 
 client.on('interactionCreate', async interaction => {
+  if (interaction.isStringSelectMenu() && interaction.customId === 'select-search') {
+      const mgr = managers.get(interaction.guildId);
+      if (!mgr) return interaction.reply({ content: 'エラー: 再生環境が見つかりません', ephemeral: true });
+      
+      const selectedUrl = interaction.values[0];
+      const selectedOption = interaction.message.components[0].components[0].options.find(o => o.value === selectedUrl);
+      const title = selectedOption ? selectedOption.label : 'Selected Track';
+
+      mgr.enqueueResource({ source: selectedUrl, title: title });
+      return interaction.update({ content: `キューに追加しました: **${title}**`, components: [] });
+  }
+
   if (!interaction.isCommand()) return;
   try {
     const { commandName } = interaction;
@@ -113,7 +134,6 @@ client.on('interactionCreate', async interaction => {
 
     if (!member.voice.channel) return interaction.reply({ content: 'VCに参加してください', ephemeral: true });
 
-    // ここで textChannel (interaction.channel) を渡す
     const mgr = getOrCreateManager(interaction.guildId, member.voice.channel, interaction.channel);
 
     if (commandName === 'join') {
@@ -129,28 +149,50 @@ client.on('interactionCreate', async interaction => {
       const query = interaction.options.getString('query');
       await interaction.deferReply();
       try {
-        await mgr.enqueueQuery(query);
-        return interaction.editReply(`キューに追加: ${query}`);
+        const results = await mgr.search(query);
+        if (results.length === 0) return interaction.editReply('検索結果が見つかりませんでした。');
+
+        if (results.length === 1) {
+            const track = results[0];
+            mgr.enqueueResource(track);
+            return interaction.editReply(`キューに追加: ${track.title}`);
+        }
+
+        const options = results.map((r) => ({
+            label: r.title.length > 100 ? r.title.substring(0, 97) + '...' : r.title,
+            description: r.source,
+            value: r.source,
+        }));
+
+        const row = new ActionRowBuilder().addComponents(
+            new StringSelectMenuBuilder().setCustomId('select-search').setPlaceholder('曲を選択').addOptions(options)
+        );
+
+        await interaction.editReply({ content: '候補を選択してください:', components: [row] });
       } catch (e) {
-        return interaction.editReply(`再生に失敗しました: ${e.message}`);
+        return interaction.editReply(`エラー: ${e.message}`);
       }
+      return;
     }
 
     if (commandName === 'stop') {
       mgr.stop();
-      return interaction.reply('再生を停止し、キューをクリアしました');
+      return interaction.reply('停止しました');
+    }
+
+    if (commandName === 'volume') {
+        const level = interaction.options.getInteger('level');
+        const newVol = mgr.changeVolume(level);
+        return interaction.reply(`音量を **${newVol}** (約${Math.round(newVol/100*100)}%) に変更しました`);
     }
 
     if (commandName === 'artist') {
       await interaction.deferReply();
       try {
-        // 大量のループ処理を削除し、マネージャー側のメソッドを呼ぶだけに修正
-        interaction.editReply('湘南乃風リストを取得してループ再生を開始します...（初回ロードに数秒かかります）');
+        interaction.editReply('湘南乃風ループを開始します...');
         await mgr.startArtistLoop(ARTIST_URL);
-        // 完了メッセージは startArtistLoop 完了後に出すか、上記メッセージで代用
       } catch (e) {
-        console.error('artist command error', e);
-        return interaction.followUp({ content: 'ループ開始に失敗しました', ephemeral: true });
+        return interaction.followUp({ content: '失敗しました', ephemeral: true });
       }
     }
 
@@ -163,40 +205,6 @@ client.on('interactionCreate', async interaction => {
     try {
       if (!interaction.replied) await interaction.reply({ content: 'エラーが発生しました', ephemeral: true });
     } catch (e) {}
-  }
-});
-
-client.on('messageCreate', async message => {
-  if (message.author.bot) return;
-
-  const content = message.content || '';
-  const isInTargetChannel = !TRIGGER_CHANNEL_ID || message.channel.id === TRIGGER_CHANNEL_ID;
-  const hasTriggerWord = TRIGGER_WORDS.some(w => w && content.includes(w));
-
-  // Mention
-  if (message.mentions.has(client.user)) {
-    if (!message.member.voice.channel) return message.reply('VCに参加してください');
-    const mgr = getOrCreateManager(message.guildId, message.member.voice.channel, message.channel);
-    mgr.enqueueResource({ localPath: LOCAL_AUDIO, title: 'local_audio' });
-    return message.reply('ローカル音源を再生します');
-  }
-
-  // Bigwave
-  if (isInTargetChannel && hasTriggerWord) {
-    if (!message.member.voice.channel) return message.reply('VCに参加してください');
-    const mgr = getOrCreateManager(message.guildId, message.member.voice.channel, message.channel);
-    const fs = require('fs');
-    const bigPath = fs.existsSync(BIGWAVE_AUDIO) ? BIGWAVE_AUDIO : LOCAL_AUDIO;
-    mgr.forcePlayResource({ localPath: bigPath, title: 'bigwave' });
-    return message.reply('bigwave を再生します');
-  }
-
-  // Legacy Trigger
-  if (message.content.includes(TRIGGER_TEXT)) {
-    if (!message.member.voice.channel) return message.reply('VCに参加してください');
-    const mgr = getOrCreateManager(message.guildId, message.member.voice.channel, message.channel);
-    mgr.enqueueResource({ localPath: LOCAL_AUDIO, title: 'local_audio' });
-    return message.reply('トリガ音源を再生します');
   }
 });
 

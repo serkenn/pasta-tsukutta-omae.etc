@@ -8,7 +8,11 @@ class GuildMusicManager {
     this.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Stop } });
     this.queue = [];
     this.current = null;
+    this.currentResource = null; // 現在再生中のリソースを保持（音量変更用）
+    this.volume = 0.1; // デフォルト音量 (10%)
+    
     this.textChannel = null;
+    this.lastPlayingMessage = null;
     this.disconnectTimer = null;
     this.artistPool = [];
 
@@ -22,19 +26,28 @@ class GuildMusicManager {
     this.textChannel = channel;
   }
 
-  async enqueueQuery(query) {
-    const ok = await this.findAndEnqueuePlayable(query);
-    if (!ok) throw new Error('No playable source found for query');
+  // 音量変更メソッド (0-100)
+  changeVolume(level) {
+    // 範囲制限
+    const vol = Math.max(0, Math.min(100, level));
+    this.volume = vol / 100; // 0.0 - 1.0 に変換
+
+    // 再生中のリソースがあれば即座に適用
+    if (this.currentResource && this.currentResource.volume) {
+        this.currentResource.volume.setVolume(this.volume);
+    }
+    return vol;
   }
 
-  // yt-dlp を使って URL または 検索ワードから動画情報を取得する
-  async findAndEnqueuePlayable(query) {
-    console.log('[findAndEnqueuePlayable] processing:', query);
+  // 検索処理
+  async search(query) {
+    if (query.startsWith('http://') || query.startsWith('https://')) {
+        return await this.getUrlInfo(query);
+    }
+
     return new Promise((resolve) => {
-        // --default-search ytsearch1 により、URLならそのURLを、単語なら検索してトップ1件を取得します
-        // --print でタイトルとURLだけを取得（動画はダウンロードしない）
         const yt = spawn('yt-dlp', [
-            '--default-search', 'ytsearch1',
+            '--default-search', 'ytsearch5',
             '--print', '%(title)s__SEPARATOR__%(webpage_url)s',
             '--no-playlist',
             query
@@ -43,33 +56,45 @@ class GuildMusicManager {
         let data = '';
         yt.stdout.on('data', chunk => { data += chunk; });
         
-        yt.on('close', code => {
-            if (code !== 0 || !data.trim()) {
-                console.warn('[findAndEnqueuePlayable] yt-dlp failed or found nothing. code:', code);
-                resolve(false);
-                return;
-            }
-            
-            // 出力例: "Video Title__SEPARATOR__https://youtube.com/..."
+        yt.on('close', () => {
+            if (!data.trim()) { return resolve([]); }
+            const results = [];
             const lines = data.split('\n').filter(Boolean);
-            if (lines.length === 0) {
-                resolve(false);
-                return;
+            for (const line of lines) {
+                const [title, url] = line.split('__SEPARATOR__');
+                if (title && url) {
+                    results.push({ title, source: url });
+                }
             }
-
-            const [title, url] = lines[0].split('__SEPARATOR__');
-            if (!url) {
-                resolve(false);
-                return;
-            }
-
-            this.enqueueResource({ source: url, title: title || query });
-            resolve(true);
+            resolve(results);
         });
     });
   }
 
-  // 指定URL（チャンネル）から動画リストを取得
+  async getUrlInfo(url) {
+    return new Promise((resolve) => {
+        const yt = spawn('yt-dlp', [
+            '--print', '%(title)s__SEPARATOR__%(webpage_url)s',
+            '--no-playlist',
+            url
+        ]);
+        let data = '';
+        yt.stdout.on('data', chunk => { data += chunk; });
+        yt.on('close', () => {
+            if (!data.trim()) return resolve([]);
+            const lines = data.split('\n').filter(Boolean);
+            const [title, source] = lines[0].split('__SEPARATOR__');
+            resolve([{ title: title || 'Unknown', source: source || url }]);
+        });
+    });
+  }
+
+  enqueueResource(resource) {
+    if (resource.localPath && !fs.existsSync(resource.localPath)) return;
+    this.queue.push(resource);
+    if (!this.current) this._playNext();
+  }
+
   async loadArtistTracks(channelUrl) {
     console.log('[loadArtistTracks] Fetching list from:', channelUrl);
     return new Promise((resolve) => {
@@ -83,23 +108,17 @@ class GuildMusicManager {
         yt.stdout.on('data', chunk => { data += chunk; });
         
         yt.on('close', code => {
-            if (code !== 0) {
-                console.error('[loadArtistTracks] yt-dlp failed with code', code);
-                resolve(0);
-                return;
-            }
+            if (code !== 0) { resolve(0); return; }
             const lines = data.split('\n').filter(Boolean);
             this.artistPool = lines.map(line => {
                 const [url, title] = line.split('__SEPARATOR__');
                 return { source: url, title: title || 'Unknown Title' };
             });
             
-            // シャッフル
             for (let i = this.artistPool.length - 1; i > 0; i--) {
                 const j = Math.floor(Math.random() * (i + 1));
                 [this.artistPool[i], this.artistPool[j]] = [this.artistPool[j], this.artistPool[i]];
             }
-
             console.log(`[loadArtistTracks] Loaded ${this.artistPool.length} tracks.`);
             resolve(this.artistPool.length);
         });
@@ -137,20 +156,20 @@ class GuildMusicManager {
     this.artistPool = [];
   }
 
-  enqueueResource(resource) {
-    if (resource.localPath && !fs.existsSync(resource.localPath)) return;
-    this.queue.push(resource);
-    if (!this.current) this._playNext();
-  }
-
   forcePlayResource(resource) {
     this.queue.unshift(resource);
     this.player.stop();
   }
 
   async _playNext() {
+    if (this.lastPlayingMessage) {
+        try { await this.lastPlayingMessage.delete(); } catch(e) {}
+        this.lastPlayingMessage = null;
+    }
+
     if (this.queue.length === 0) {
       this.current = null;
+      this.currentResource = null;
       return;
     }
     const next = this.queue.shift();
@@ -188,13 +207,14 @@ class GuildMusicManager {
       }
 
       if (resource) {
-        // 【修正】音量を 0.1 (10%) に設定
-        if (resource.volume) resource.volume.setVolume(0.1);
+        // 設定された音量を適用
+        if (resource.volume) resource.volume.setVolume(this.volume);
         
+        this.currentResource = resource; // リソースを保持
         this.player.play(resource);
 
         if (this.textChannel && next.source) {
-            this.textChannel.send(`🎵 **Now Playing**\n**${next.title}**\n${next.source}`).catch(e => console.error('Failed to send playing msg', e));
+            this.lastPlayingMessage = await this.textChannel.send(`🎵 **Now Playing** (Vol: ${Math.round(this.volume * 100)}%)\n**${next.title}**\n${next.source}`).catch(e => console.error('Failed to send playing msg', e));
         }
       }
     } catch (err) {
