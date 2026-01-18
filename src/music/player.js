@@ -8,13 +8,13 @@ class GuildMusicManager {
     this.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Stop } });
     this.queue = [];
     this.current = null;
-    this.currentResource = null; // 現在再生中のリソースを保持（音量変更用）
-    this.volume = 0.1; // デフォルト音量 (10%)
+    this.currentResource = null;
+    this.volume = 0.5; // 初期音量を50%に変更 (聞こえない問題対策)
     
     this.textChannel = null;
     this.lastPlayingMessage = null;
-    this.disconnectTimer = null;
     this.artistPool = [];
+    this.disconnectTimer = null;
 
     this.player.on(AudioPlayerStatus.Idle, () => this._playNext());
     this.player.on('error', err => console.error('[Player Error]', err));
@@ -26,25 +26,41 @@ class GuildMusicManager {
     this.textChannel = channel;
   }
 
-  // 音量変更メソッド (0-100)
   changeVolume(level) {
-    // 範囲制限
     const vol = Math.max(0, Math.min(100, level));
-    this.volume = vol / 100; // 0.0 - 1.0 に変換
-
-    // 再生中のリソースがあれば即座に適用
+    this.volume = vol / 100;
     if (this.currentResource && this.currentResource.volume) {
         this.currentResource.volume.setVolume(this.volume);
     }
     return vol;
   }
 
-  // 検索処理
+  // URL取得ヘルパー (yt-dlp --get-url)
+  async getStreamUrl(sourceUrl) {
+    return new Promise((resolve) => {
+        const yt = spawn('yt-dlp', [
+            '-f', 'bestaudio', // 最高音質
+            '--get-url',       // 動画データではなくURLを取得
+            sourceUrl
+        ]);
+        let data = '';
+        yt.stdout.on('data', chunk => { data += chunk; });
+        yt.on('close', code => {
+            if (code !== 0 || !data.trim()) {
+                console.error('[getStreamUrl] failed to get URL');
+                resolve(null);
+            } else {
+                // 複数行返ってくる場合があるので最初の1行を使う
+                resolve(data.split('\n')[0].trim());
+            }
+        });
+    });
+  }
+
   async search(query) {
     if (query.startsWith('http://') || query.startsWith('https://')) {
         return await this.getUrlInfo(query);
     }
-
     return new Promise((resolve) => {
         const yt = spawn('yt-dlp', [
             '--default-search', 'ytsearch5',
@@ -52,19 +68,15 @@ class GuildMusicManager {
             '--no-playlist',
             query
         ]);
-
         let data = '';
         yt.stdout.on('data', chunk => { data += chunk; });
-        
         yt.on('close', () => {
             if (!data.trim()) { return resolve([]); }
             const results = [];
             const lines = data.split('\n').filter(Boolean);
             for (const line of lines) {
                 const [title, url] = line.split('__SEPARATOR__');
-                if (title && url) {
-                    results.push({ title, source: url });
-                }
+                if (title && url) results.push({ title, source: url });
             }
             resolve(results);
         });
@@ -103,10 +115,8 @@ class GuildMusicManager {
             '--print', '%(url)s__SEPARATOR__%(title)s',
             channelUrl
         ]);
-
         let data = '';
         yt.stdout.on('data', chunk => { data += chunk; });
-        
         yt.on('close', code => {
             if (code !== 0) { resolve(0); return; }
             const lines = data.split('\n').filter(Boolean);
@@ -114,7 +124,6 @@ class GuildMusicManager {
                 const [url, title] = line.split('__SEPARATOR__');
                 return { source: url, title: title || 'Unknown Title' };
             });
-            
             for (let i = this.artistPool.length - 1; i > 0; i--) {
                 const j = Math.floor(Math.random() * (i + 1));
                 [this.artistPool[i], this.artistPool[j]] = [this.artistPool[j], this.artistPool[i]];
@@ -162,6 +171,7 @@ class GuildMusicManager {
   }
 
   async _playNext() {
+    // 前回のNow Playingメッセージを確実に削除
     if (this.lastPlayingMessage) {
         try { await this.lastPlayingMessage.delete(); } catch(e) {}
         this.lastPlayingMessage = null;
@@ -178,39 +188,27 @@ class GuildMusicManager {
     try {
       let resource;
       const resourceOptions = { 
-          inputType: StreamType.Arbitrary, 
           inlineVolume: true, 
           metadata: { title: next.title } 
       };
 
       if (next.localPath) {
+        console.log('[playNext] playing local file', next.localPath);
         const stream = fs.createReadStream(next.localPath);
-        resource = createAudioResource(stream, resourceOptions);
+        resource = createAudioResource(stream, { ...resourceOptions, inputType: StreamType.Arbitrary });
       } else if (next.source) {
-        console.log('[playNext] attempting:', next.title);
-        
-        const ytDlpProcess = spawn('yt-dlp', [
-            '-f', 'bestaudio',
-            '--no-playlist',
-            '--buffer-size', '16K',
-            '-o', '-',
-            '-q',
-            next.source
-        ]);
+        console.log('[playNext] fetching URL for:', next.title);
+        // 【修正】 yt-dlp で直接の音声URLを取得してから再生する (安定性向上)
+        const streamUrl = await this.getStreamUrl(next.source);
+        if (!streamUrl) throw new Error('Failed to get stream URL');
 
-        ytDlpProcess.on('error', err => {
-            console.error('[playNext] yt-dlp spawn error:', err);
-            setTimeout(() => this._playNext(), 1000);
-        });
-
-        resource = createAudioResource(ytDlpProcess.stdout, resourceOptions);
+        // URLを渡して createAudioResource (FFmpegが内部で処理)
+        resource = createAudioResource(streamUrl, resourceOptions);
       }
 
       if (resource) {
-        // 設定された音量を適用
         if (resource.volume) resource.volume.setVolume(this.volume);
-        
-        this.currentResource = resource; // リソースを保持
+        this.currentResource = resource;
         this.player.play(resource);
 
         if (this.textChannel && next.source) {

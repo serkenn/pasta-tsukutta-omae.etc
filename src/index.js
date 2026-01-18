@@ -46,6 +46,17 @@ function getOrCreateManager(guildId, voiceChannel, textChannel) {
   return mgr;
 }
 
+// メッセージ自動削除ヘルパー
+async function replyAndAutoDelete(interaction, content, timeout = 10000) {
+    try {
+        const reply = await interaction.editReply(content);
+        setTimeout(async () => {
+            try { await interaction.deleteReply(); } catch(e) {}
+        }, timeout);
+        return reply;
+    } catch(e) { console.error('AutoDelete failed', e); }
+}
+
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
@@ -58,13 +69,12 @@ client.once('ready', async () => {
     { name: 'skip', description: 'Skip current track' },
     { name: 'pause', description: 'Pause' },
     { name: 'resume', description: 'Resume' },
-    // 音量コマンドの追加
     { 
         name: 'volume', 
         description: 'Set volume (0-100)', 
         options: [{ 
             name: 'level', 
-            type: 4, // Integer
+            type: 4, 
             description: 'Volume percentage (0-100)', 
             required: true,
             minValue: 0,
@@ -79,9 +89,6 @@ client.once('ready', async () => {
   } else {
     await client.application.commands.set(commands);
   }
-
-  process.on('unhandledRejection', (reason, p) => console.error('Unhandled Rejection at:', p, 'reason:', reason));
-  process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
 });
 
 client.on('voiceStateUpdate', (oldState, newState) => {
@@ -115,6 +122,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 });
 
 client.on('interactionCreate', async interaction => {
+  // 選択メニューの処理
   if (interaction.isStringSelectMenu() && interaction.customId === 'select-search') {
       const mgr = managers.get(interaction.guildId);
       if (!mgr) return interaction.reply({ content: 'エラー: 再生環境が見つかりません', ephemeral: true });
@@ -124,7 +132,13 @@ client.on('interactionCreate', async interaction => {
       const title = selectedOption ? selectedOption.label : 'Selected Track';
 
       mgr.enqueueResource({ source: selectedUrl, title: title });
-      return interaction.update({ content: `キューに追加しました: **${title}**`, components: [] });
+      
+      // メニューを更新してから削除予約
+      await interaction.update({ content: `キューに追加しました: **${title}**`, components: [] });
+      setTimeout(async () => {
+          try { await interaction.deleteReply(); } catch(e) {}
+      }, 10000);
+      return;
   }
 
   if (!interaction.isCommand()) return;
@@ -137,12 +151,16 @@ client.on('interactionCreate', async interaction => {
     const mgr = getOrCreateManager(interaction.guildId, member.voice.channel, interaction.channel);
 
     if (commandName === 'join') {
-      return interaction.reply('参加しました');
+      await interaction.reply('参加しました');
+      setTimeout(() => interaction.deleteReply(), 5000);
+      return;
     }
 
     if (commandName === 'leave') {
       try { mgr.connection.destroy(); managers.delete(interaction.guildId); } catch(e){}
-      return interaction.reply('退出しました');
+      await interaction.reply('退出しました');
+      setTimeout(() => interaction.deleteReply(), 5000);
+      return;
     }
 
     if (commandName === 'play') {
@@ -150,12 +168,14 @@ client.on('interactionCreate', async interaction => {
       await interaction.deferReply();
       try {
         const results = await mgr.search(query);
-        if (results.length === 0) return interaction.editReply('検索結果が見つかりませんでした。');
+        if (results.length === 0) {
+            return replyAndAutoDelete(interaction, '検索結果が見つかりませんでした。');
+        }
 
         if (results.length === 1) {
             const track = results[0];
             mgr.enqueueResource(track);
-            return interaction.editReply(`キューに追加: ${track.title}`);
+            return replyAndAutoDelete(interaction, `キューに追加: ${track.title}`);
         }
 
         const options = results.map((r) => ({
@@ -168,37 +188,60 @@ client.on('interactionCreate', async interaction => {
             new StringSelectMenuBuilder().setCustomId('select-search').setPlaceholder('曲を選択').addOptions(options)
         );
 
+        // 選択メニューはユーザー入力を待つため、ここでは自動削除しない（選択イベント側で処理）
         await interaction.editReply({ content: '候補を選択してください:', components: [row] });
       } catch (e) {
-        return interaction.editReply(`エラー: ${e.message}`);
+        return replyAndAutoDelete(interaction, `エラー: ${e.message}`);
       }
       return;
     }
 
     if (commandName === 'stop') {
       mgr.stop();
-      return interaction.reply('停止しました');
+      await interaction.reply('停止しました');
+      setTimeout(() => interaction.deleteReply(), 5000);
+      return;
     }
 
     if (commandName === 'volume') {
         const level = interaction.options.getInteger('level');
         const newVol = mgr.changeVolume(level);
-        return interaction.reply(`音量を **${newVol}** (約${Math.round(newVol/100*100)}%) に変更しました`);
+        await interaction.reply(`音量を **${newVol}** (約${Math.round(newVol/100*100)}%) に変更しました`);
+        setTimeout(() => interaction.deleteReply(), 5000);
+        return;
     }
 
     if (commandName === 'artist') {
       await interaction.deferReply();
       try {
-        interaction.editReply('湘南乃風ループを開始します...');
+        // メッセージを表示後、自動削除
+        await interaction.editReply('湘南乃風ループを開始します...');
         await mgr.startArtistLoop(ARTIST_URL);
+        setTimeout(() => interaction.deleteReply(), 10000);
       } catch (e) {
-        return interaction.followUp({ content: '失敗しました', ephemeral: true });
+        return replyAndAutoDelete(interaction, '失敗しました');
       }
+      return;
     }
 
-    if (commandName === 'skip') { mgr.skip(); return interaction.reply('スキップしました'); }
-    if (commandName === 'pause') { mgr.pause(); return interaction.reply('一時停止しました'); }
-    if (commandName === 'resume') { mgr.resume(); return interaction.reply('再開しました'); }
+    if (commandName === 'skip') { 
+        mgr.skip(); 
+        await interaction.reply('スキップしました'); 
+        setTimeout(() => interaction.deleteReply(), 5000);
+        return; 
+    }
+    if (commandName === 'pause') { 
+        mgr.pause(); 
+        await interaction.reply('一時停止しました'); 
+        setTimeout(() => interaction.deleteReply(), 5000);
+        return; 
+    }
+    if (commandName === 'resume') { 
+        mgr.resume(); 
+        await interaction.reply('再開しました'); 
+        setTimeout(() => interaction.deleteReply(), 5000);
+        return; 
+    }
 
   } catch (err) {
     console.error('interactionCreate error', err);
